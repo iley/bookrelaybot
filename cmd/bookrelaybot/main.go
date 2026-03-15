@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
@@ -25,7 +27,7 @@ type pendingSetup struct {
 
 type pendingConfirmation struct {
 	chatID     int64
-	filePath   string
+	bookDir    string
 	title      string
 	author     string
 	messageID  int
@@ -39,6 +41,9 @@ func confirmationKeyboard() tgbotapi.InlineKeyboardMarkup {
 			tgbotapi.NewInlineKeyboardButtonData("Edit title", "edit_title"),
 			tgbotapi.NewInlineKeyboardButtonData("Edit author", "edit_author"),
 		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Cancel", "cancel"),
+		),
 	)
 }
 
@@ -46,7 +51,36 @@ func confirmationText(title, author string) string {
 	return fmt.Sprintf("Title: %s\nAuthor: %s", title, author)
 }
 
-func downloadFile(bot *tgbotapi.BotAPI, doc *tgbotapi.Document, dir string) (string, error) {
+func newBookDir(parentDir string) (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("generate uuid: %w", err)
+	}
+	name := "book_" + hex.EncodeToString(b[:])
+	bookDir := filepath.Join(parentDir, name)
+	if err := os.MkdirAll(bookDir, 0755); err != nil {
+		return "", fmt.Errorf("create book directory %s: %w", bookDir, err)
+	}
+	return bookDir, nil
+}
+
+func cleanupBookDirs(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		log.Printf("Failed to read directory %s for cleanup: %v", dir, err)
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() && strings.HasPrefix(e.Name(), "book_") {
+			p := filepath.Join(dir, e.Name())
+			log.Printf("Cleaning up leftover book directory: %s", p)
+			os.RemoveAll(p)
+		}
+	}
+}
+
+// downloadFile downloads a document into a new book_<uuid> subdirectory as original.epub.
+func downloadFile(bot *tgbotapi.BotAPI, doc *tgbotapi.Document, dir string) (bookDir string, err error) {
 	fileURL, err := bot.GetFileDirectURL(doc.FileID)
 	if err != nil {
 		return "", fmt.Errorf("get file URL: %w", err)
@@ -62,20 +96,27 @@ func downloadFile(bot *tgbotapi.BotAPI, doc *tgbotapi.Document, dir string) (str
 		return "", fmt.Errorf("download file: unexpected status %d", resp.StatusCode)
 	}
 
-	savePath := filepath.Join(dir, filepath.Base(doc.FileName))
+	bookDir, err = newBookDir(dir)
+	if err != nil {
+		return "", err
+	}
+
+	savePath := filepath.Join(bookDir, "original.epub")
 	out, err := os.Create(savePath)
 	if err != nil {
+		os.RemoveAll(bookDir)
 		return "", fmt.Errorf("create file %s: %w", savePath, err)
 	}
 
 	_, err = io.Copy(out, resp.Body)
 	out.Close()
 	if err != nil {
+		os.RemoveAll(bookDir)
 		return "", fmt.Errorf("save file %s: %w", savePath, err)
 	}
 
 	log.Printf("Saved file to %s", savePath)
-	return savePath, nil
+	return bookDir, nil
 }
 
 func processDocument(bot *tgbotapi.BotAPI, chatID int64, doc *tgbotapi.Document, dir string, confirmations map[int64]*pendingConfirmation, userID int64) {
@@ -85,7 +126,7 @@ func processDocument(bot *tgbotapi.BotAPI, chatID int64, doc *tgbotapi.Document,
 		return
 	}
 
-	savePath, err := downloadFile(bot, doc, dir)
+	bookDir, err := downloadFile(bot, doc, dir)
 	if err != nil {
 		log.Printf("Failed to process document: %v", err)
 		reply := tgbotapi.NewMessage(chatID, "Failed to download the file. Please try again.")
@@ -93,9 +134,11 @@ func processDocument(bot *tgbotapi.BotAPI, chatID int64, doc *tgbotapi.Document,
 		return
 	}
 
-	meta, err := epub.ReadMetadata(savePath)
+	originalPath := filepath.Join(bookDir, "original.epub")
+	meta, err := epub.ReadMetadata(originalPath)
 	if err != nil {
-		log.Printf("Failed to read EPUB metadata from %s: %v", savePath, err)
+		log.Printf("Failed to read EPUB metadata from %s: %v", originalPath, err)
+		os.RemoveAll(bookDir)
 		reply := tgbotapi.NewMessage(chatID, "Failed to read EPUB metadata. Is the file a valid EPUB?")
 		bot.Send(reply)
 		return
@@ -107,12 +150,13 @@ func processDocument(bot *tgbotapi.BotAPI, chatID int64, doc *tgbotapi.Document,
 	sent, err := bot.Send(msg)
 	if err != nil {
 		log.Printf("Failed to send confirmation message: %v", err)
+		os.RemoveAll(bookDir)
 		return
 	}
 
 	confirmations[userID] = &pendingConfirmation{
 		chatID:    chatID,
-		filePath:  savePath,
+		bookDir:   bookDir,
 		title:     meta.Title,
 		author:    meta.Author,
 		messageID: sent.MessageID,
@@ -122,6 +166,23 @@ func processDocument(bot *tgbotapi.BotAPI, chatID int64, doc *tgbotapi.Document,
 func isValidEmail(s string) bool {
 	parts := strings.Split(s, "@")
 	return len(parts) == 2 && parts[0] != "" && strings.Contains(parts[1], ".")
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+
+	_, err = io.Copy(out, in)
+	out.Close()
+	return err
 }
 
 func sanitizeFilename(s string) string {
@@ -183,6 +244,8 @@ func main() {
 		log.Fatalf("Failed to create directory %s: %v", *dir, err)
 	}
 
+	cleanupBookDirs(*dir)
+
 	store, err := settings.NewStore(filepath.Join(*dir, "settings.json"))
 	if err != nil {
 		log.Fatalf("Failed to load settings: %v", err)
@@ -220,40 +283,32 @@ func main() {
 			case "confirm":
 				us, _ := store.GetSettings(strconv.FormatInt(userID, 10))
 
-				if err := epub.WriteMetadata(pc.filePath, epub.Metadata{Title: pc.title, Author: pc.author}); err != nil {
+				originalPath := filepath.Join(pc.bookDir, "original.epub")
+				newName := sanitizeFilename(pc.title+" - "+pc.author) + ".epub"
+				sendPath := filepath.Join(pc.bookDir, newName)
+
+				if err := copyFile(originalPath, sendPath); err != nil {
+					log.Printf("Failed to copy file: %v", err)
+					reply := tgbotapi.NewMessage(pc.chatID, "Failed to prepare the book for sending. Please try again.")
+					bot.Send(reply)
+					break
+				}
+
+				if err := epub.WriteMetadata(sendPath, epub.Metadata{Title: pc.title, Author: pc.author}); err != nil {
 					log.Printf("Failed to write metadata: %v", err)
 					reply := tgbotapi.NewMessage(pc.chatID, "Failed to update book metadata. Please try again.")
 					bot.Send(reply)
 					break
 				}
 
-				tmpDir, err := os.MkdirTemp("", "bookrelaybot-*")
-				if err != nil {
-					log.Printf("Failed to create temp directory: %v", err)
-					reply := tgbotapi.NewMessage(pc.chatID, "Failed to prepare the book for sending. Please try again.")
-					bot.Send(reply)
-					break
-				}
-
-				newName := sanitizeFilename(pc.title+" - "+pc.author) + ".epub"
-				newPath := filepath.Join(tmpDir, newName)
-				if err := os.Rename(pc.filePath, newPath); err != nil {
-					log.Printf("Failed to rename file: %v", err)
-					os.RemoveAll(tmpDir)
-					reply := tgbotapi.NewMessage(pc.chatID, "Failed to rename file. Please try again.")
-					bot.Send(reply)
-					break
-				}
-				pc.filePath = newPath
-
-				if err := m.SendBook(us.KindleEmail, newPath); err != nil {
+				if err := m.SendBook(us.KindleEmail, sendPath); err != nil {
 					log.Printf("Failed to send book: %v", err)
 					reply := tgbotapi.NewMessage(pc.chatID, "Failed to email the book. Please try again.")
 					bot.Send(reply)
 					break
 				}
 
-				os.RemoveAll(tmpDir)
+				os.RemoveAll(pc.bookDir)
 				reply := tgbotapi.NewMessage(pc.chatID, fmt.Sprintf("Sent %q to %s!", pc.title, us.KindleEmail))
 				bot.Send(reply)
 				delete(confirmations, userID)
@@ -267,6 +322,12 @@ func main() {
 				pc.waitingFor = "author"
 				reply := tgbotapi.NewMessage(pc.chatID, "Send me the new author.")
 				bot.Send(reply)
+
+			case "cancel":
+				os.RemoveAll(pc.bookDir)
+				edit := tgbotapi.NewEditMessageText(pc.chatID, pc.messageID, "Cancelled.")
+				bot.Send(edit)
+				delete(confirmations, userID)
 			}
 
 			callback := tgbotapi.NewCallback(update.CallbackQuery.ID, "")
@@ -295,6 +356,15 @@ func main() {
 		// Handle text input for editing title/author.
 		if pc, ok := confirmations[userID]; ok && pc.waitingFor != "" && update.Message.Text != "" {
 			text := strings.TrimSpace(update.Message.Text)
+
+			if text == "/cancel" {
+				os.RemoveAll(pc.bookDir)
+				edit := tgbotapi.NewEditMessageText(pc.chatID, pc.messageID, "Cancelled.")
+				bot.Send(edit)
+				delete(confirmations, userID)
+				continue
+			}
+
 			switch pc.waitingFor {
 			case "title":
 				pc.title = text

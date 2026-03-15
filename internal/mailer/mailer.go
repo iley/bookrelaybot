@@ -46,7 +46,20 @@ func (m *Mailer) SendBook(to, filePath string) error {
 	return nil
 }
 
+func sanitizeHeaderValue(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r == '\r' || r == '\n' {
+			b.WriteRune('_')
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
 func buildMessage(from, to, filename string, fileData []byte) []byte {
+	filename = sanitizeHeaderValue(filename)
 	boundary := "==BookRelayBotBoundary=="
 
 	var b strings.Builder
