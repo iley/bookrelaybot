@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -54,16 +55,19 @@ func downloadFile(bot *tgbotapi.BotAPI, doc *tgbotapi.Document, dir string) (str
 	if err != nil {
 		return "", fmt.Errorf("download file: %w", err)
 	}
+	defer resp.Body.Close()
 
-	savePath := filepath.Join(dir, doc.FileName)
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("download file: unexpected status %d", resp.StatusCode)
+	}
+
+	savePath := filepath.Join(dir, filepath.Base(doc.FileName))
 	out, err := os.Create(savePath)
 	if err != nil {
-		resp.Body.Close()
 		return "", fmt.Errorf("create file %s: %w", savePath, err)
 	}
 
 	_, err = io.Copy(out, resp.Body)
-	resp.Body.Close()
 	out.Close()
 	if err != nil {
 		return "", fmt.Errorf("save file %s: %w", savePath, err)
@@ -73,7 +77,7 @@ func downloadFile(bot *tgbotapi.BotAPI, doc *tgbotapi.Document, dir string) (str
 	return savePath, nil
 }
 
-func processDocument(bot *tgbotapi.BotAPI, chatID int64, doc *tgbotapi.Document, dir string, confirmations map[string]*pendingConfirmation, username string) {
+func processDocument(bot *tgbotapi.BotAPI, chatID int64, doc *tgbotapi.Document, dir string, confirmations map[int64]*pendingConfirmation, userID int64) {
 	if !strings.HasSuffix(strings.ToLower(doc.FileName), ".epub") {
 		reply := tgbotapi.NewMessage(chatID, "Only EPUB files are supported.")
 		bot.Send(reply)
@@ -105,7 +109,7 @@ func processDocument(bot *tgbotapi.BotAPI, chatID int64, doc *tgbotapi.Document,
 		return
 	}
 
-	confirmations[username] = &pendingConfirmation{
+	confirmations[userID] = &pendingConfirmation{
 		chatID:    chatID,
 		filePath:  savePath,
 		title:     meta.Title,
@@ -140,6 +144,10 @@ func main() {
 		log.Fatal("BOOKRELAYBOT_TOKEN environment variable is required")
 	}
 
+	if err := os.MkdirAll(*dir, 0755); err != nil {
+		log.Fatalf("Failed to create directory %s: %v", *dir, err)
+	}
+
 	store, err := settings.NewStore(filepath.Join(*dir, "settings.json"))
 	if err != nil {
 		log.Fatalf("Failed to load settings: %v", err)
@@ -155,8 +163,8 @@ func main() {
 	u.Timeout = 60
 	updates := bot.GetUpdatesChan(u)
 
-	pending := make(map[string]*pendingSetup)
-	confirmations := make(map[string]*pendingConfirmation)
+	pending := make(map[int64]*pendingSetup)
+	confirmations := make(map[int64]*pendingConfirmation)
 
 	for update := range updates {
 		// Handle callback queries (inline button presses).
@@ -165,8 +173,8 @@ func main() {
 			if from == nil {
 				continue
 			}
-			username := strings.ToLower(from.UserName)
-			pc, ok := confirmations[username]
+			userID := from.ID
+			pc, ok := confirmations[userID]
 			if !ok {
 				callback := tgbotapi.NewCallback(update.CallbackQuery.ID, "No pending file.")
 				bot.Request(callback)
@@ -177,7 +185,7 @@ func main() {
 			case "confirm":
 				reply := tgbotapi.NewMessage(pc.chatID, fmt.Sprintf("Sending file with title %q author %q", pc.title, pc.author))
 				bot.Send(reply)
-				delete(confirmations, username)
+				delete(confirmations, userID)
 
 			case "edit_title":
 				pc.waitingFor = "title"
@@ -200,20 +208,21 @@ func main() {
 		}
 
 		from := update.Message.From
-		if len(allowed) > 0 && (from == nil || !allowed[strings.ToLower(from.UserName)]) {
-			username := ""
-			if from != nil {
-				username = from.UserName
-			}
-			log.Printf("Ignoring message from unauthorized user %q", username)
+		if from == nil {
+			continue
+		}
+
+		if len(allowed) > 0 && !allowed[strings.ToLower(from.UserName)] {
+			log.Printf("Ignoring message from unauthorized user %q (ID %d)", from.UserName, from.ID)
 			continue
 		}
 
 		chatID := update.Message.Chat.ID
-		username := strings.ToLower(from.UserName)
+		userID := from.ID
+		userKey := strconv.FormatInt(userID, 10)
 
 		// Handle text input for editing title/author.
-		if pc, ok := confirmations[username]; ok && pc.waitingFor != "" && update.Message.Text != "" {
+		if pc, ok := confirmations[userID]; ok && pc.waitingFor != "" && update.Message.Text != "" {
 			text := strings.TrimSpace(update.Message.Text)
 			switch pc.waitingFor {
 			case "title":
@@ -231,16 +240,16 @@ func main() {
 			continue
 		}
 
-		_, hasSettings := store.GetSettings(username)
+		_, hasSettings := store.GetSettings(userKey)
 		if !hasSettings {
-			ps, isPending := pending[username]
+			ps, isPending := pending[userID]
 			if isPending {
 				// User is in setup: expecting an email reply.
 				text := strings.TrimSpace(update.Message.Text)
 				if text != "" && isValidEmail(text) {
 					us := settings.UserSettings{KindleEmail: text}
-					if err := store.SetSettings(username, us); err != nil {
-						log.Printf("Failed to save settings for %s: %v", username, err)
+					if err := store.SetSettings(userKey, us); err != nil {
+						log.Printf("Failed to save settings for user %d: %v", userID, err)
 						reply := tgbotapi.NewMessage(chatID, "Failed to save settings. Please try again.")
 						bot.Send(reply)
 						continue
@@ -248,12 +257,12 @@ func main() {
 					reply := tgbotapi.NewMessage(chatID, fmt.Sprintf("Saved! Kindle email set to %s", text))
 					bot.Send(reply)
 					if ps.document != nil {
-						processDocument(bot, chatID, ps.document, *dir, confirmations, username)
+						processDocument(bot, chatID, ps.document, *dir, confirmations, userID)
 					}
-					delete(pending, username)
+					delete(pending, userID)
 				} else if update.Message.Document != nil {
 					ps.document = update.Message.Document
-					log.Printf("Received file %q from %s (pending setup)", update.Message.Document.FileName, from.UserName)
+					log.Printf("Received file %q from user %d (pending setup)", update.Message.Document.FileName, userID)
 					reply := tgbotapi.NewMessage(chatID, "I still need your Send-to-Kindle email address first. Please send it as a text message.")
 					bot.Send(reply)
 				} else {
@@ -265,9 +274,9 @@ func main() {
 				ps := &pendingSetup{chatID: chatID}
 				if update.Message.Document != nil {
 					ps.document = update.Message.Document
-					log.Printf("Received file %q from %s (pending setup)", update.Message.Document.FileName, from.UserName)
+					log.Printf("Received file %q from user %d (pending setup)", update.Message.Document.FileName, userID)
 				}
-				pending[username] = ps
+				pending[userID] = ps
 				reply := tgbotapi.NewMessage(chatID, "Welcome! Please send me your Send-to-Kindle email address.")
 				bot.Send(reply)
 			}
@@ -280,7 +289,7 @@ func main() {
 		}
 
 		doc := update.Message.Document
-		log.Printf("Received file %q from %s", doc.FileName, from.UserName)
-		processDocument(bot, chatID, doc, *dir, confirmations, username)
+		log.Printf("Received file %q from user %d", doc.FileName, userID)
+		processDocument(bot, chatID, doc, *dir, confirmations, userID)
 	}
 }

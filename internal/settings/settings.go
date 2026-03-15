@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 )
 
@@ -36,20 +35,20 @@ func NewStore(path string) (*Store, error) {
 	return s, nil
 }
 
-func (s *Store) GetSettings(username string) (UserSettings, bool) {
+func (s *Store) GetSettings(key string) (UserSettings, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	us, ok := s.settings[strings.ToLower(username)]
+	us, ok := s.settings[key]
 	if !ok {
 		return UserSettings{}, false
 	}
 	return *us, true
 }
 
-func (s *Store) SetSettings(username string, us UserSettings) error {
+func (s *Store) SetSettings(key string, us UserSettings) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.settings[strings.ToLower(username)] = &us
+	s.settings[key] = &us
 	return s.save()
 }
 
