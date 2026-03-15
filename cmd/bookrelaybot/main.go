@@ -12,6 +12,7 @@ import (
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
+	"github.com/iley/bookrelaybot/internal/epub"
 	"github.com/iley/bookrelaybot/internal/settings"
 )
 
@@ -20,38 +21,97 @@ type pendingSetup struct {
 	document *tgbotapi.Document
 }
 
-func processDocument(bot *tgbotapi.BotAPI, chatID int64, doc *tgbotapi.Document, dir string) {
+type pendingConfirmation struct {
+	chatID     int64
+	filePath   string
+	title      string
+	author     string
+	messageID  int
+	waitingFor string // "", "title", or "author"
+}
+
+func confirmationKeyboard() tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Looks good", "confirm"),
+			tgbotapi.NewInlineKeyboardButtonData("Edit title", "edit_title"),
+			tgbotapi.NewInlineKeyboardButtonData("Edit author", "edit_author"),
+		),
+	)
+}
+
+func confirmationText(title, author string) string {
+	return fmt.Sprintf("Title: %s\nAuthor: %s", title, author)
+}
+
+func downloadFile(bot *tgbotapi.BotAPI, doc *tgbotapi.Document, dir string) (string, error) {
 	fileURL, err := bot.GetFileDirectURL(doc.FileID)
 	if err != nil {
-		log.Printf("Failed to get file URL: %v", err)
-		return
+		return "", fmt.Errorf("get file URL: %w", err)
 	}
 
 	resp, err := http.Get(fileURL)
 	if err != nil {
-		log.Printf("Failed to download file: %v", err)
-		return
+		return "", fmt.Errorf("download file: %w", err)
 	}
 
 	savePath := filepath.Join(dir, doc.FileName)
 	out, err := os.Create(savePath)
 	if err != nil {
 		resp.Body.Close()
-		log.Printf("Failed to create file %s: %v", savePath, err)
-		return
+		return "", fmt.Errorf("create file %s: %w", savePath, err)
 	}
 
 	_, err = io.Copy(out, resp.Body)
 	resp.Body.Close()
 	out.Close()
 	if err != nil {
-		log.Printf("Failed to save file %s: %v", savePath, err)
-		return
+		return "", fmt.Errorf("save file %s: %w", savePath, err)
 	}
 
 	log.Printf("Saved file to %s", savePath)
-	reply := tgbotapi.NewMessage(chatID, fmt.Sprintf("File %s received", doc.FileName))
-	bot.Send(reply)
+	return savePath, nil
+}
+
+func processDocument(bot *tgbotapi.BotAPI, chatID int64, doc *tgbotapi.Document, dir string, confirmations map[string]*pendingConfirmation, username string) {
+	if !strings.HasSuffix(strings.ToLower(doc.FileName), ".epub") {
+		reply := tgbotapi.NewMessage(chatID, "Only EPUB files are supported.")
+		bot.Send(reply)
+		return
+	}
+
+	savePath, err := downloadFile(bot, doc, dir)
+	if err != nil {
+		log.Printf("Failed to process document: %v", err)
+		reply := tgbotapi.NewMessage(chatID, "Failed to download the file. Please try again.")
+		bot.Send(reply)
+		return
+	}
+
+	meta, err := epub.ReadMetadata(savePath)
+	if err != nil {
+		log.Printf("Failed to read EPUB metadata from %s: %v", savePath, err)
+		reply := tgbotapi.NewMessage(chatID, "Failed to read EPUB metadata. Is the file a valid EPUB?")
+		bot.Send(reply)
+		return
+	}
+
+	msg := tgbotapi.NewMessage(chatID, confirmationText(meta.Title, meta.Author))
+	keyboard := confirmationKeyboard()
+	msg.ReplyMarkup = keyboard
+	sent, err := bot.Send(msg)
+	if err != nil {
+		log.Printf("Failed to send confirmation message: %v", err)
+		return
+	}
+
+	confirmations[username] = &pendingConfirmation{
+		chatID:    chatID,
+		filePath:  savePath,
+		title:     meta.Title,
+		author:    meta.Author,
+		messageID: sent.MessageID,
+	}
 }
 
 func isValidEmail(s string) bool {
@@ -96,8 +156,45 @@ func main() {
 	updates := bot.GetUpdatesChan(u)
 
 	pending := make(map[string]*pendingSetup)
+	confirmations := make(map[string]*pendingConfirmation)
 
 	for update := range updates {
+		// Handle callback queries (inline button presses).
+		if update.CallbackQuery != nil {
+			from := update.CallbackQuery.From
+			if from == nil {
+				continue
+			}
+			username := strings.ToLower(from.UserName)
+			pc, ok := confirmations[username]
+			if !ok {
+				callback := tgbotapi.NewCallback(update.CallbackQuery.ID, "No pending file.")
+				bot.Request(callback)
+				continue
+			}
+
+			switch update.CallbackQuery.Data {
+			case "confirm":
+				reply := tgbotapi.NewMessage(pc.chatID, fmt.Sprintf("Sending file with title %q author %q", pc.title, pc.author))
+				bot.Send(reply)
+				delete(confirmations, username)
+
+			case "edit_title":
+				pc.waitingFor = "title"
+				reply := tgbotapi.NewMessage(pc.chatID, "Send me the new title.")
+				bot.Send(reply)
+
+			case "edit_author":
+				pc.waitingFor = "author"
+				reply := tgbotapi.NewMessage(pc.chatID, "Send me the new author.")
+				bot.Send(reply)
+			}
+
+			callback := tgbotapi.NewCallback(update.CallbackQuery.ID, "")
+			bot.Request(callback)
+			continue
+		}
+
 		if update.Message == nil {
 			continue
 		}
@@ -114,6 +211,25 @@ func main() {
 
 		chatID := update.Message.Chat.ID
 		username := strings.ToLower(from.UserName)
+
+		// Handle text input for editing title/author.
+		if pc, ok := confirmations[username]; ok && pc.waitingFor != "" && update.Message.Text != "" {
+			text := strings.TrimSpace(update.Message.Text)
+			switch pc.waitingFor {
+			case "title":
+				pc.title = text
+			case "author":
+				pc.author = text
+			}
+			pc.waitingFor = ""
+
+			// Update the confirmation message with new values.
+			edit := tgbotapi.NewEditMessageText(pc.chatID, pc.messageID, confirmationText(pc.title, pc.author))
+			keyboard := confirmationKeyboard()
+			edit.ReplyMarkup = &keyboard
+			bot.Send(edit)
+			continue
+		}
 
 		_, hasSettings := store.GetSettings(username)
 		if !hasSettings {
@@ -132,7 +248,7 @@ func main() {
 					reply := tgbotapi.NewMessage(chatID, fmt.Sprintf("Saved! Kindle email set to %s", text))
 					bot.Send(reply)
 					if ps.document != nil {
-						processDocument(bot, chatID, ps.document, *dir)
+						processDocument(bot, chatID, ps.document, *dir, confirmations, username)
 					}
 					delete(pending, username)
 				} else if update.Message.Document != nil {
@@ -165,6 +281,6 @@ func main() {
 
 		doc := update.Message.Document
 		log.Printf("Received file %q from %s", doc.FileName, from.UserName)
-		processDocument(bot, chatID, doc, *dir)
+		processDocument(bot, chatID, doc, *dir, confirmations, username)
 	}
 }
