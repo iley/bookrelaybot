@@ -32,18 +32,23 @@ func New(cfg Config) *Mailer {
 
 // SendBook emails an EPUB file as an attachment.
 func (m *Mailer) SendBook(to, filePath string) error {
+	fileName := filepath.Base(filePath)
+	log.Printf("Reading file %s for email attachment", filePath)
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return fmt.Errorf("read file: %w", err)
 	}
+	log.Printf("File %s read successfully (%d bytes)", fileName, len(data))
 
-	msg := buildMessage(m.cfg.From, to, filepath.Base(filePath), data)
+	msg := buildMessage(m.cfg.From, to, fileName, data)
 
 	addr := fmt.Sprintf("%s:%d", m.cfg.Host, m.cfg.Port)
 	auth := smtp.PlainAuth("", m.cfg.Username, m.cfg.Password, m.cfg.Host)
+	log.Printf("Connecting to SMTP server %s to send %s from %s to %s", addr, fileName, m.cfg.From, to)
 	if err := smtp.SendMail(addr, auth, m.cfg.From, []string{to}, msg); err != nil {
 		return fmt.Errorf("send mail: %w", err)
 	}
+	log.Printf("SMTP send successful: %s -> %s (file: %s, %d bytes)", m.cfg.From, to, fileName, len(data))
 	return nil
 }
 
