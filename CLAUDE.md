@@ -35,4 +35,9 @@ Key domain behavior (partially implemented): Kindle uses the **file name** as th
 ## Configuration
 
 - `BOOKRELAYBOT_TOKEN` — Telegram bot token (required)
+- `BOOKRELAY_SMTP_USER` — SMTP username (required)
+- `BOOKRELAY_SMTP_PASSWORD` — SMTP password (required)
 - `--dir` flag — directory to save received files (defaults to `.`)
+- `--smtp-host` flag — SMTP server hostname (required)
+- `--smtp-port` flag — SMTP server port (defaults to `587`)
+- `--smtp-from` flag — sender email address (required)

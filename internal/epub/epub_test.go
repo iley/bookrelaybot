@@ -1,6 +1,8 @@
 package epub
 
 import (
+	"io"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -38,5 +40,43 @@ func TestReadMetadataFileNotFound(t *testing.T) {
 	_, err := ReadMetadata("/nonexistent/path.epub")
 	if err == nil {
 		t.Fatal("expected error for nonexistent file")
+	}
+}
+
+func TestWriteMetadataRoundtrip(t *testing.T) {
+	src := filepath.Join("..", "..", "testdata", "moby_dick.epub")
+
+	// Copy to a temp file.
+	tmp, err := os.CreateTemp(t.TempDir(), "*.epub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srcFile, err := os.Open(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(tmp, srcFile); err != nil {
+		t.Fatal(err)
+	}
+	srcFile.Close()
+	tmp.Close()
+
+	newMeta := Metadata{
+		Title:  "New Title",
+		Author: "New Author",
+	}
+	if err := WriteMetadata(tmp.Name(), newMeta); err != nil {
+		t.Fatalf("WriteMetadata: %v", err)
+	}
+
+	got, err := ReadMetadata(tmp.Name())
+	if err != nil {
+		t.Fatalf("ReadMetadata after write: %v", err)
+	}
+	if got.Title != newMeta.Title {
+		t.Errorf("title = %q, want %q", got.Title, newMeta.Title)
+	}
+	if got.Author != newMeta.Author {
+		t.Errorf("author = %q, want %q", got.Author, newMeta.Author)
 	}
 }

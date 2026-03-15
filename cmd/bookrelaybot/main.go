@@ -14,6 +14,7 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
 	"github.com/iley/bookrelaybot/internal/epub"
+	"github.com/iley/bookrelaybot/internal/mailer"
 	"github.com/iley/bookrelaybot/internal/settings"
 )
 
@@ -123,9 +124,19 @@ func isValidEmail(s string) bool {
 	return len(parts) == 2 && parts[0] != "" && strings.Contains(parts[1], ".")
 }
 
+func sanitizeFilename(s string) string {
+	for _, c := range []string{"/", "\\", ":", "\x00"} {
+		s = strings.ReplaceAll(s, c, "_")
+	}
+	return s
+}
+
 func main() {
 	dir := flag.String("dir", ".", "directory to save received files")
 	allowlist := flag.String("allowlist", "", "comma-separated list of allowed Telegram usernames")
+	smtpHost := flag.String("smtp-host", "", "SMTP server hostname")
+	smtpPort := flag.Int("smtp-port", 587, "SMTP server port")
+	smtpFrom := flag.String("smtp-from", "", "sender email address")
 	flag.Parse()
 
 	allowed := make(map[string]bool)
@@ -143,6 +154,21 @@ func main() {
 	if token == "" {
 		log.Fatal("BOOKRELAYBOT_TOKEN environment variable is required")
 	}
+
+	smtpUser := os.Getenv("BOOKRELAY_SMTP_USER")
+	smtpPassword := os.Getenv("BOOKRELAY_SMTP_PASSWORD")
+
+	if *smtpHost == "" || *smtpFrom == "" || smtpUser == "" || smtpPassword == "" {
+		log.Fatal("SMTP configuration is required: --smtp-host, --smtp-from, BOOKRELAY_SMTP_USER, BOOKRELAY_SMTP_PASSWORD")
+	}
+
+	m := mailer.New(mailer.Config{
+		Host:     *smtpHost,
+		Port:     *smtpPort,
+		From:     *smtpFrom,
+		Username: smtpUser,
+		Password: smtpPassword,
+	})
 
 	if err := os.MkdirAll(*dir, 0755); err != nil {
 		log.Fatalf("Failed to create directory %s: %v", *dir, err)
@@ -183,7 +209,34 @@ func main() {
 
 			switch update.CallbackQuery.Data {
 			case "confirm":
-				reply := tgbotapi.NewMessage(pc.chatID, fmt.Sprintf("Sending file with title %q author %q", pc.title, pc.author))
+				us, _ := store.GetSettings(strconv.FormatInt(userID, 10))
+
+				if err := epub.WriteMetadata(pc.filePath, epub.Metadata{Title: pc.title, Author: pc.author}); err != nil {
+					log.Printf("Failed to write metadata: %v", err)
+					reply := tgbotapi.NewMessage(pc.chatID, "Failed to update book metadata. Please try again.")
+					bot.Send(reply)
+					break
+				}
+
+				newName := sanitizeFilename(pc.title+" - "+pc.author) + ".epub"
+				newPath := filepath.Join(filepath.Dir(pc.filePath), newName)
+				if err := os.Rename(pc.filePath, newPath); err != nil {
+					log.Printf("Failed to rename file: %v", err)
+					reply := tgbotapi.NewMessage(pc.chatID, "Failed to rename file. Please try again.")
+					bot.Send(reply)
+					break
+				}
+				pc.filePath = newPath
+
+				if err := m.SendBook(us.KindleEmail, newPath); err != nil {
+					log.Printf("Failed to send book: %v", err)
+					reply := tgbotapi.NewMessage(pc.chatID, "Failed to email the book. Please try again.")
+					bot.Send(reply)
+					break
+				}
+
+				os.Remove(newPath)
+				reply := tgbotapi.NewMessage(pc.chatID, fmt.Sprintf("Sent %q to %s!", pc.title, us.KindleEmail))
 				bot.Send(reply)
 				delete(confirmations, userID)
 

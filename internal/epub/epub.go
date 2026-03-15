@@ -4,7 +4,11 @@ import (
 	"archive/zip"
 	"encoding/xml"
 	"fmt"
+	"io"
+	"os"
 	"path"
+
+	"github.com/beevik/etree"
 )
 
 // Metadata holds the title and author extracted from an EPUB file.
@@ -41,7 +45,7 @@ func ReadMetadata(filepath string) (Metadata, error) {
 	defer r.Close()
 
 	// Find the OPF file path from container.xml.
-	opfPath, err := findOPFPath(r)
+	opfPath, err := findOPFPath(&r.Reader)
 	if err != nil {
 		return Metadata{}, err
 	}
@@ -69,7 +73,7 @@ func ReadMetadata(filepath string) (Metadata, error) {
 	return Metadata{}, fmt.Errorf("opf file %q not found in archive", opfPath)
 }
 
-func findOPFPath(r *zip.ReadCloser) (string, error) {
+func findOPFPath(r *zip.Reader) (string, error) {
 	for _, f := range r.File {
 		if path.Clean(f.Name) == "META-INF/container.xml" {
 			rc, err := f.Open()
@@ -89,4 +93,85 @@ func findOPFPath(r *zip.ReadCloser) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("META-INF/container.xml not found")
+}
+
+// WriteMetadata updates the title and author in an EPUB file's OPF metadata.
+func WriteMetadata(filepath string, meta Metadata) error {
+	r, err := zip.OpenReader(filepath)
+	if err != nil {
+		return fmt.Errorf("open epub: %w", err)
+	}
+	defer r.Close()
+
+	opfPath, err := findOPFPath(&r.Reader)
+	if err != nil {
+		return err
+	}
+
+	tmpPath := filepath + ".tmp"
+	tmpFile, err := os.Create(tmpPath)
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
+	}
+	defer func() {
+		tmpFile.Close()
+		os.Remove(tmpPath) // clean up on error; no-op after successful rename
+	}()
+
+	w := zip.NewWriter(tmpFile)
+
+	for _, f := range r.File {
+		if f.Name == opfPath {
+			// Parse and modify OPF with etree.
+			rc, err := f.Open()
+			if err != nil {
+				return fmt.Errorf("open opf: %w", err)
+			}
+			doc := etree.NewDocument()
+			if _, err := doc.ReadFrom(rc); err != nil {
+				rc.Close()
+				return fmt.Errorf("parse opf: %w", err)
+			}
+			rc.Close()
+
+			if el := doc.FindElement("//title"); el != nil {
+				el.SetText(meta.Title)
+			}
+			if el := doc.FindElement("//creator"); el != nil {
+				el.SetText(meta.Author)
+			}
+
+			header := f.FileHeader
+			fw, err := w.CreateHeader(&header)
+			if err != nil {
+				return fmt.Errorf("create opf entry: %w", err)
+			}
+			doc.Indent(2)
+			if _, err := doc.WriteTo(fw); err != nil {
+				return fmt.Errorf("write opf: %w", err)
+			}
+		} else {
+			// Copy entry verbatim.
+			raw, err := f.OpenRaw()
+			if err != nil {
+				return fmt.Errorf("open raw %s: %w", f.Name, err)
+			}
+			fw, err := w.CreateRaw(&f.FileHeader)
+			if err != nil {
+				return fmt.Errorf("create raw %s: %w", f.Name, err)
+			}
+			if _, err := io.Copy(fw, raw); err != nil {
+				return fmt.Errorf("copy raw %s: %w", f.Name, err)
+			}
+		}
+	}
+
+	if err := w.Close(); err != nil {
+		return fmt.Errorf("close zip writer: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("close temp file: %w", err)
+	}
+
+	return os.Rename(tmpPath, filepath)
 }
