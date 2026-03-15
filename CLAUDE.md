@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-BookRelayBot is a Telegram bot that forwards ebooks to Amazon's Send-to-Kindle email service. Users send ebook files (EPUB, FB2, MOBI) via Telegram DM; the bot converts non-EPUB formats to EPUB using Calibre, extracts/edits metadata, renames the file, and emails it to the user's Kindle address via SMTP.
+BookRelayBot is a Telegram bot that forwards ebooks to Amazon's Send-to-Kindle email service. Users send ebook files (EPUB, FB2, MOBI, AZW3) via Telegram DM; the bot converts non-EPUB formats to EPUB using Calibre, extracts/edits metadata, renames the file, and emails it to the user's Kindle address via SMTP.
 
 ## Build & Run
 
@@ -35,7 +35,7 @@ Key domain behavior (partially implemented): Kindle uses the **file name** as th
 ### Supported formats
 
 - **EPUB** — passed through directly
-- **FB2, MOBI** — converted to EPUB via Calibre's `ebook-convert` CLI (`internal/converter` package)
+- **FB2, MOBI, AZW3** — converted to EPUB via Calibre's `ebook-convert` CLI (`internal/converter` package)
 
 ### Dependencies
 

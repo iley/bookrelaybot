@@ -1,8 +1,8 @@
 # BookRelayBot
 
-A Telegram bot that forwards EPUB ebooks to Amazon's Send-to-Kindle email service.
+A Telegram bot that forwards ebooks to Amazon's Send-to-Kindle email service.
 
-Users send an EPUB file via Telegram DM. The bot extracts metadata (title, author), lets the user review and edit it, then emails the file to their Kindle address via SMTP.
+Users send an ebook file (EPUB, FB2, MOBI, AZW3) via Telegram DM. The bot converts non-EPUB formats to EPUB using Calibre, extracts metadata (title, author), lets the user review and edit it, then emails the file to their Kindle address via SMTP.
 
 ## Configuration
 
