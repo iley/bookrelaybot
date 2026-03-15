@@ -68,7 +68,7 @@ func buildMessage(from, to, filename string, fileData []byte) []byte {
 	b.WriteString("--" + boundary + "\r\n")
 	b.WriteString("Content-Type: application/epub+zip\r\n")
 	b.WriteString("Content-Transfer-Encoding: base64\r\n")
-	b.WriteString("Content-Disposition: attachment; filename=\"" + filename + "\"\r\n")
+	b.WriteString("Content-Disposition: " + mime.FormatMediaType("attachment", map[string]string{"filename": filename}) + "\r\n")
 	b.WriteString("\r\n")
 
 	encoded := base64.StdEncoding.EncodeToString(fileData)

@@ -134,11 +134,22 @@ func WriteMetadata(filepath string, meta Metadata) error {
 			}
 			rc.Close()
 
+			metaEl := doc.FindElement("//metadata")
+			if metaEl == nil {
+				return fmt.Errorf("no <metadata> element found in OPF")
+			}
+
 			if el := doc.FindElement("//title"); el != nil {
 				el.SetText(meta.Title)
+			} else {
+				titleEl := metaEl.CreateElement("dc:title")
+				titleEl.SetText(meta.Title)
 			}
 			if el := doc.FindElement("//creator"); el != nil {
 				el.SetText(meta.Author)
+			} else {
+				creatorEl := metaEl.CreateElement("dc:creator")
+				creatorEl.SetText(meta.Author)
 			}
 
 			header := f.FileHeader

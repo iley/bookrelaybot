@@ -125,10 +125,19 @@ func isValidEmail(s string) bool {
 }
 
 func sanitizeFilename(s string) string {
-	for _, c := range []string{"/", "\\", ":", "\x00"} {
-		s = strings.ReplaceAll(s, c, "_")
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r < 0x20, // control characters including \n, \r, \t
+			r == '/', r == '\\', r == ':', r == '"',
+			r == '<', r == '>', r == '|', r == '?', r == '*',
+			r == 0x7f, r == 0:
+			b.WriteRune('_')
+		default:
+			b.WriteRune(r)
+		}
 	}
-	return s
+	return b.String()
 }
 
 func main() {
@@ -218,10 +227,19 @@ func main() {
 					break
 				}
 
+				tmpDir, err := os.MkdirTemp("", "bookrelaybot-*")
+				if err != nil {
+					log.Printf("Failed to create temp directory: %v", err)
+					reply := tgbotapi.NewMessage(pc.chatID, "Failed to prepare the book for sending. Please try again.")
+					bot.Send(reply)
+					break
+				}
+
 				newName := sanitizeFilename(pc.title+" - "+pc.author) + ".epub"
-				newPath := filepath.Join(filepath.Dir(pc.filePath), newName)
+				newPath := filepath.Join(tmpDir, newName)
 				if err := os.Rename(pc.filePath, newPath); err != nil {
 					log.Printf("Failed to rename file: %v", err)
+					os.RemoveAll(tmpDir)
 					reply := tgbotapi.NewMessage(pc.chatID, "Failed to rename file. Please try again.")
 					bot.Send(reply)
 					break
@@ -235,7 +253,7 @@ func main() {
 					break
 				}
 
-				os.Remove(newPath)
+				os.RemoveAll(tmpDir)
 				reply := tgbotapi.NewMessage(pc.chatID, fmt.Sprintf("Sent %q to %s!", pc.title, us.KindleEmail))
 				bot.Send(reply)
 				delete(confirmations, userID)
