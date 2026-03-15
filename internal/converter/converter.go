@@ -21,9 +21,9 @@ func NeedsConversion(ext string) bool {
 	return SupportedFormats[ext]
 }
 
-// IsSupportedFormat returns true if the extension is EPUB or a convertible format.
+// IsSupportedFormat returns true if the extension is EPUB, a convertible format, or ZIP.
 func IsSupportedFormat(ext string) bool {
-	return ext == ".epub" || SupportedFormats[ext]
+	return ext == ".epub" || ext == ".zip" || SupportedFormats[ext]
 }
 
 // CheckAvailable verifies that ebook-convert is on PATH.

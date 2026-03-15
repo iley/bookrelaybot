@@ -18,6 +18,7 @@ import (
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
+	"github.com/iley/bookrelaybot/internal/archive"
 	"github.com/iley/bookrelaybot/internal/converter"
 	"github.com/iley/bookrelaybot/internal/epub"
 	"github.com/iley/bookrelaybot/internal/mailer"
@@ -203,7 +204,7 @@ func (b *Bot) processDocument(chatID int64, doc *tgbotapi.Document, userID int64
 	ext := strings.ToLower(filepath.Ext(doc.FileName))
 	if !converter.IsSupportedFormat(ext) {
 		reply := tgbotapi.NewMessage(chatID,
-			"Unsupported file format. Supported formats: EPUB, FB2, MOBI.")
+			"Unsupported file format. Supported formats: EPUB, FB2, MOBI, ZIP.")
 		b.sendMsg(reply)
 		return
 	}
@@ -216,6 +217,20 @@ func (b *Bot) processDocument(chatID int64, doc *tgbotapi.Document, userID int64
 		reply := tgbotapi.NewMessage(chatID, "Failed to download the file. Please try again.")
 		b.sendMsg(reply)
 		return
+	}
+
+	if ext == ".zip" {
+		extractedPath, err := archive.ExtractBook(downloadedPath, bookDir)
+		if err != nil {
+			log.Printf("Failed to extract ebook from zip %s: %v", doc.FileName, err)
+			removeAll(bookDir)
+			reply := tgbotapi.NewMessage(chatID,
+				fmt.Sprintf("Failed to extract ebook from ZIP: %v", err))
+			b.sendMsg(reply)
+			return
+		}
+		downloadedPath = extractedPath
+		ext = strings.ToLower(filepath.Ext(extractedPath))
 	}
 
 	epubPath := downloadedPath
