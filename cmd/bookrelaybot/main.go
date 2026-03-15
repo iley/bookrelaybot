@@ -18,6 +18,7 @@ import (
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
+	"github.com/iley/bookrelaybot/internal/converter"
 	"github.com/iley/bookrelaybot/internal/epub"
 	"github.com/iley/bookrelaybot/internal/mailer"
 	"github.com/iley/bookrelaybot/internal/settings"
@@ -31,6 +32,7 @@ type pendingSetup struct {
 type pendingConfirmation struct {
 	chatID     int64
 	bookDir    string
+	epubPath   string
 	title      string
 	author     string
 	messageID  int
@@ -67,45 +69,46 @@ func newBookDir(parentDir string) (string, error) {
 	return bookDir, nil
 }
 
-// downloadFile downloads a document into a new book_<uuid> subdirectory as original.epub.
-func downloadFile(bot *tgbotapi.BotAPI, doc *tgbotapi.Document, dir string) (bookDir string, err error) {
+// downloadFile downloads a document into a new subdirectory, preserving its extension.
+// Returns the book directory and the path to the saved file.
+func downloadFile(bot *tgbotapi.BotAPI, doc *tgbotapi.Document, dir string, ext string) (bookDir string, savedPath string, err error) {
 	fileURL, err := bot.GetFileDirectURL(doc.FileID)
 	if err != nil {
-		return "", fmt.Errorf("get file URL: %w", err)
+		return "", "", fmt.Errorf("get file URL: %w", err)
 	}
 
 	client := &http.Client{Timeout: 2 * time.Minute}
 	resp, err := client.Get(fileURL)
 	if err != nil {
-		return "", fmt.Errorf("download file: %w", err)
+		return "", "", fmt.Errorf("download file: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("download file: unexpected status %d", resp.StatusCode)
+		return "", "", fmt.Errorf("download file: unexpected status %d", resp.StatusCode)
 	}
 
 	bookDir, err = newBookDir(dir)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
-	savePath := filepath.Join(bookDir, "original.epub")
+	savePath := filepath.Join(bookDir, "original"+ext)
 	out, err := os.Create(savePath)
 	if err != nil {
 		os.RemoveAll(bookDir)
-		return "", fmt.Errorf("create file %s: %w", savePath, err)
+		return "", "", fmt.Errorf("create file %s: %w", savePath, err)
 	}
 
 	_, err = io.Copy(out, resp.Body)
 	out.Close()
 	if err != nil {
 		os.RemoveAll(bookDir)
-		return "", fmt.Errorf("save file %s: %w", savePath, err)
+		return "", "", fmt.Errorf("save file %s: %w", savePath, err)
 	}
 
 	log.Printf("Saved file to %s", savePath)
-	return bookDir, nil
+	return bookDir, savePath, nil
 }
 
 func cancelPendingConfirmation(bot *tgbotapi.BotAPI, confirmations map[int64]*pendingConfirmation, userID int64) {
@@ -118,15 +121,17 @@ func cancelPendingConfirmation(bot *tgbotapi.BotAPI, confirmations map[int64]*pe
 }
 
 func processDocument(bot *tgbotapi.BotAPI, chatID int64, doc *tgbotapi.Document, dir string, confirmations map[int64]*pendingConfirmation, userID int64) {
-	if !strings.HasSuffix(strings.ToLower(doc.FileName), ".epub") {
-		reply := tgbotapi.NewMessage(chatID, "Only EPUB files are supported.")
+	ext := strings.ToLower(filepath.Ext(doc.FileName))
+	if !converter.IsSupportedFormat(ext) {
+		reply := tgbotapi.NewMessage(chatID,
+			"Unsupported file format. Supported formats: EPUB, FB2, MOBI.")
 		bot.Send(reply)
 		return
 	}
 
 	cancelPendingConfirmation(bot, confirmations, userID)
 
-	bookDir, err := downloadFile(bot, doc, dir)
+	bookDir, downloadedPath, err := downloadFile(bot, doc, dir, ext)
 	if err != nil {
 		log.Printf("Failed to process document: %v", err)
 		reply := tgbotapi.NewMessage(chatID, "Failed to download the file. Please try again.")
@@ -134,10 +139,30 @@ func processDocument(bot *tgbotapi.BotAPI, chatID int64, doc *tgbotapi.Document,
 		return
 	}
 
-	originalPath := filepath.Join(bookDir, "original.epub")
-	meta, err := epub.ReadMetadata(originalPath)
+	epubPath := downloadedPath
+
+	if converter.NeedsConversion(ext) {
+		statusMsg := tgbotapi.NewMessage(chatID, "Converting to EPUB...")
+		bot.Send(statusMsg)
+
+		epubPath, err = converter.ConvertToEPUB(downloadedPath, bookDir)
+		if err != nil {
+			log.Printf("Conversion failed for %s: %v", doc.FileName, err)
+			os.RemoveAll(bookDir)
+			userMsg := err.Error()
+			if ce, ok := err.(*converter.ConvertError); ok {
+				userMsg = ce.UserMessage()
+			}
+			reply := tgbotapi.NewMessage(chatID,
+				fmt.Sprintf("Failed to convert the file to EPUB: %s", userMsg))
+			bot.Send(reply)
+			return
+		}
+	}
+
+	meta, err := epub.ReadMetadata(epubPath)
 	if err != nil {
-		log.Printf("Failed to read EPUB metadata from %s: %v", originalPath, err)
+		log.Printf("Failed to read EPUB metadata from %s: %v", epubPath, err)
 		os.RemoveAll(bookDir)
 		reply := tgbotapi.NewMessage(chatID, "Failed to read EPUB metadata. Is the file a valid EPUB?")
 		bot.Send(reply)
@@ -157,6 +182,7 @@ func processDocument(bot *tgbotapi.BotAPI, chatID int64, doc *tgbotapi.Document,
 	confirmations[userID] = &pendingConfirmation{
 		chatID:    chatID,
 		bookDir:   bookDir,
+		epubPath:  epubPath,
 		title:     meta.Title,
 		author:    meta.Author,
 		messageID: sent.MessageID,
@@ -257,6 +283,10 @@ func main() {
 		}
 	}
 
+	if err := converter.CheckAvailable(); err != nil {
+		log.Fatalf("Preflight check failed: %v", err)
+	}
+
 	if removeBooksOnShutdown {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -311,11 +341,10 @@ func main() {
 			case "confirm":
 				us, _ := store.GetSettings(strconv.FormatInt(userID, 10))
 
-				originalPath := filepath.Join(pc.bookDir, "original.epub")
 				newName := sanitizeFilename(pc.title+" - "+pc.author) + ".epub"
 				sendPath := filepath.Join(pc.bookDir, newName)
 
-				if err := copyFile(originalPath, sendPath); err != nil {
+				if err := copyFile(pc.epubPath, sendPath); err != nil {
 					log.Printf("Failed to copy file: %v", err)
 					reply := tgbotapi.NewMessage(pc.chatID, "Failed to prepare the book for sending. Please try again.")
 					bot.Send(reply)

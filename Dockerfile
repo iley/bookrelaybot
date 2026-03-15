@@ -6,9 +6,11 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /bookrelaybot ./cmd/bookrelaybot
 
-FROM --platform=linux/amd64 alpine:3.21
+FROM --platform=linux/amd64 debian:bookworm-slim
 
-RUN apk add --no-cache ca-certificates
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates calibre && \
+    rm -rf /var/lib/apt/lists/*
 COPY --from=builder /bookrelaybot /usr/local/bin/bookrelaybot
 
 ENTRYPOINT ["bookrelaybot"]
