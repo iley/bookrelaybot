@@ -18,7 +18,8 @@ Users send an EPUB file via Telegram DM. The bot extracts metadata (title, autho
 
 | Flag | Default | Description |
 |---|---|---|
-| `--dir` | `.` | Directory for state and temporary book storage |
+| `--dir` | *(temporary directory)* | Directory for book file storage (removed on shutdown if not set) |
+| `--settings` | `settings.json` | Path to the settings file |
 | `--smtp-host` | *(required)* | SMTP server hostname |
 | `--smtp-port` | `587` | SMTP server port |
 | `--smtp-from` | *(required)* | Sender email address |
@@ -26,10 +27,8 @@ Users send an EPUB file via Telegram DM. The bot extracts metadata (title, autho
 
 ## State
 
-All persistent state lives in the `--dir` directory:
-
-- `settings.json` — per-user settings (Kindle email addresses)
-- `book_*` subdirectories — temporary storage for books being processed (cleaned up on startup)
+- `settings.json` (or the path given by `--settings`) — per-user settings (Kindle email addresses)
+- Subdirectories under `--dir` — temporary storage for books being processed
 
 ## Running with Docker
 
@@ -40,10 +39,11 @@ docker run -d \
   -e BOOKRELAY_SMTP_PASSWORD=secret \
   -v /path/to/data:/data \
   bookrelaybot \
-  --dir /data \
+  --settings /data/settings.json \
+  --dir /data/books \
   --smtp-host smtp.example.com \
   --smtp-from user@example.com \
   --allowlist alice,bob
 ```
 
-The mounted `/path/to/data` directory will contain `settings.json` and any in-progress book files.
+The mounted `/path/to/data` directory will contain `settings.json` and the `books/` subdirectory for in-progress book files.

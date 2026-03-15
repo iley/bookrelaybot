@@ -329,13 +329,15 @@ func main() {
 					break
 				}
 
+				log.Printf("Sending book %q (file: %s) to %s", pc.title, sendPath, us.KindleEmail)
 				if err := m.SendBook(us.KindleEmail, sendPath); err != nil {
-					log.Printf("Failed to send book: %v", err)
+					log.Printf("Failed to send book %q to %s: %v", pc.title, us.KindleEmail, err)
 					reply := tgbotapi.NewMessage(pc.chatID, "Failed to email the book. Please try again.")
 					bot.Send(reply)
 					break
 				}
 
+				log.Printf("Successfully sent book %q (file: %s) to %s", pc.title, sendPath, us.KindleEmail)
 				os.RemoveAll(pc.bookDir)
 				reply := tgbotapi.NewMessage(pc.chatID, fmt.Sprintf("Sent %q to %s!", pc.title, us.KindleEmail))
 				bot.Send(reply)

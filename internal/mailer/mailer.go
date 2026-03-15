@@ -3,6 +3,7 @@ package mailer
 import (
 	"encoding/base64"
 	"fmt"
+	"log"
 	"mime"
 	"net/smtp"
 	"os"
