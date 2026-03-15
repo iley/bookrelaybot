@@ -161,6 +161,9 @@ func WriteMetadata(filepath string, meta Metadata) error {
 			if _, err := doc.WriteTo(fw); err != nil {
 				return fmt.Errorf("write opf: %w", err)
 			}
+		} else if f.FileInfo().IsDir() {
+			// Directory entries are created implicitly; skip them.
+			continue
 		} else {
 			// Copy entry verbatim.
 			raw, err := f.OpenRaw()
