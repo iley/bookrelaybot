@@ -19,7 +19,15 @@ A Telegram bot that forwards ebooks to Amazon's Send-to-Kindle email service.
 
 ## Author and Title Handling
 
-The bot ensures that the title and author metadata in the EPUB file are set correctly before sending to Kindle. This is important because Send-to-Kindle uses EPUB metadata to determine how the book appears on the device.
+Send-to-Kindle determines the book's displayed title and author differently:
+
+- **Title**: Taken from the **file name**, not EPUB metadata. This is a long-standing Amazon behavior. If the file is named `MyBook.epub`, the Kindle library will display "MyBook" as the title.
+- **Author**: Extracted from **EPUB metadata** (the `<dc:creator>` field in the OPF file). Amazon previously showed "Unknown" for all sideloaded EPUBs but has since fixed this.
+
+Because of this, the bot must do both:
+
+1. **Set EPUB metadata** — at minimum `<dc:creator>` (author), and `<dc:title>` for correctness.
+2. **Rename the file** — e.g. `Title - Author.epub`, since Kindle uses the file name as the displayed title.
 
 ## Tech Stack
 
