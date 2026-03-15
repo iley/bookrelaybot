@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
@@ -86,7 +87,8 @@ func downloadFile(bot *tgbotapi.BotAPI, doc *tgbotapi.Document, dir string) (boo
 		return "", fmt.Errorf("get file URL: %w", err)
 	}
 
-	resp, err := http.Get(fileURL)
+	client := &http.Client{Timeout: 2 * time.Minute}
+	resp, err := client.Get(fileURL)
 	if err != nil {
 		return "", fmt.Errorf("download file: %w", err)
 	}
@@ -119,12 +121,23 @@ func downloadFile(bot *tgbotapi.BotAPI, doc *tgbotapi.Document, dir string) (boo
 	return bookDir, nil
 }
 
+func cancelPendingConfirmation(bot *tgbotapi.BotAPI, confirmations map[int64]*pendingConfirmation, userID int64) {
+	if pc, ok := confirmations[userID]; ok {
+		os.RemoveAll(pc.bookDir)
+		edit := tgbotapi.NewEditMessageText(pc.chatID, pc.messageID, "Cancelled (new file received).")
+		bot.Send(edit)
+		delete(confirmations, userID)
+	}
+}
+
 func processDocument(bot *tgbotapi.BotAPI, chatID int64, doc *tgbotapi.Document, dir string, confirmations map[int64]*pendingConfirmation, userID int64) {
 	if !strings.HasSuffix(strings.ToLower(doc.FileName), ".epub") {
 		reply := tgbotapi.NewMessage(chatID, "Only EPUB files are supported.")
 		bot.Send(reply)
 		return
 	}
+
+	cancelPendingConfirmation(bot, confirmations, userID)
 
 	bookDir, err := downloadFile(bot, doc, dir)
 	if err != nil {
