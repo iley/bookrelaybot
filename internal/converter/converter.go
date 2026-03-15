@@ -14,6 +14,7 @@ const ebookConvert = "ebook-convert"
 var SupportedFormats = map[string]bool{
 	".fb2":  true,
 	".mobi": true,
+	".azw3": true,
 }
 
 // NeedsConversion returns true if the extension requires conversion to EPUB.

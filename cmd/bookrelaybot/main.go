@@ -204,7 +204,7 @@ func (b *Bot) processDocument(chatID int64, doc *tgbotapi.Document, userID int64
 	ext := strings.ToLower(filepath.Ext(doc.FileName))
 	if !converter.IsSupportedFormat(ext) {
 		reply := tgbotapi.NewMessage(chatID,
-			"Unsupported file format. Supported formats: EPUB, FB2, MOBI, ZIP.")
+			"Unsupported file format. Supported formats: EPUB, FB2, MOBI, AZW3, ZIP.")
 		b.sendMsg(reply)
 		return
 	}
