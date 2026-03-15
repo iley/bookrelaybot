@@ -9,9 +9,11 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -57,27 +59,12 @@ func newBookDir(parentDir string) (string, error) {
 	if _, err := rand.Read(b[:]); err != nil {
 		return "", fmt.Errorf("generate uuid: %w", err)
 	}
-	name := "book_" + hex.EncodeToString(b[:])
+	name := hex.EncodeToString(b[:])
 	bookDir := filepath.Join(parentDir, name)
 	if err := os.MkdirAll(bookDir, 0755); err != nil {
 		return "", fmt.Errorf("create book directory %s: %w", bookDir, err)
 	}
 	return bookDir, nil
-}
-
-func cleanupBookDirs(dir string) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		log.Printf("Failed to read directory %s for cleanup: %v", dir, err)
-		return
-	}
-	for _, e := range entries {
-		if e.IsDir() && strings.HasPrefix(e.Name(), "book_") {
-			p := filepath.Join(dir, e.Name())
-			log.Printf("Cleaning up leftover book directory: %s", p)
-			os.RemoveAll(p)
-		}
-	}
 }
 
 // downloadFile downloads a document into a new book_<uuid> subdirectory as original.epub.
@@ -215,7 +202,8 @@ func sanitizeFilename(s string) string {
 }
 
 func main() {
-	dir := flag.String("dir", ".", "directory to save received files")
+	dir := flag.String("dir", "", "directory to save received book files (temporary directory if not set)")
+	settingsPath := flag.String("settings", "settings.json", "path to the settings file")
 	allowlist := flag.String("allowlist", "", "comma-separated list of allowed Telegram usernames")
 	smtpHost := flag.String("smtp-host", "", "SMTP server hostname")
 	smtpPort := flag.Int("smtp-port", 587, "SMTP server port")
@@ -253,13 +241,40 @@ func main() {
 		Password: smtpPassword,
 	})
 
-	if err := os.MkdirAll(*dir, 0755); err != nil {
-		log.Fatalf("Failed to create directory %s: %v", *dir, err)
+	bookDir := *dir
+	var removeBooksOnShutdown bool
+	if bookDir == "" {
+		tmp, err := os.MkdirTemp("", "bookrelaybot-*")
+		if err != nil {
+			log.Fatalf("Failed to create temporary directory: %v", err)
+		}
+		bookDir = tmp
+		removeBooksOnShutdown = true
+		log.Printf("Using temporary book directory: %s", bookDir)
+	} else {
+		if err := os.MkdirAll(bookDir, 0755); err != nil {
+			log.Fatalf("Failed to create directory %s: %v", bookDir, err)
+		}
 	}
 
-	cleanupBookDirs(*dir)
+	if removeBooksOnShutdown {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		go func() {
+			<-sigCh
+			log.Printf("Shutting down, removing temporary directory %s", bookDir)
+			os.RemoveAll(bookDir)
+			os.Exit(0)
+		}()
+	}
 
-	store, err := settings.NewStore(filepath.Join(*dir, "settings.json"))
+	if dir := filepath.Dir(*settingsPath); dir != "." {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			log.Fatalf("Failed to create settings directory %s: %v", dir, err)
+		}
+	}
+
+	store, err := settings.NewStore(*settingsPath)
 	if err != nil {
 		log.Fatalf("Failed to load settings: %v", err)
 	}
@@ -411,7 +426,7 @@ func main() {
 					reply := tgbotapi.NewMessage(chatID, fmt.Sprintf("Saved! Kindle email set to %s", text))
 					bot.Send(reply)
 					if ps.document != nil {
-						processDocument(bot, chatID, ps.document, *dir, confirmations, userID)
+						processDocument(bot, chatID, ps.document, bookDir, confirmations, userID)
 					}
 					delete(pending, userID)
 				} else if update.Message.Document != nil {
@@ -444,6 +459,6 @@ func main() {
 
 		doc := update.Message.Document
 		log.Printf("Received file %q from user %d", doc.FileName, userID)
-		processDocument(bot, chatID, doc, *dir, confirmations, userID)
+		processDocument(bot, chatID, doc, bookDir, confirmations, userID)
 	}
 }
