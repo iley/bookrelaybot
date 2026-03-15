@@ -39,6 +39,31 @@ type pendingConfirmation struct {
 	waitingFor string // "", "title", or "author"
 }
 
+// Bot holds the runtime state for the Telegram bot.
+type Bot struct {
+	api           *tgbotapi.BotAPI
+	store         *settings.Store
+	mailer        *mailer.Mailer
+	bookDir       string
+	allowed       map[string]bool
+	pending       map[int64]*pendingSetup
+	confirmations map[int64]*pendingConfirmation
+}
+
+func newBot(api *tgbotapi.BotAPI, store *settings.Store, m *mailer.Mailer, bookDir string, allowed map[string]bool) *Bot {
+	return &Bot{
+		api:           api,
+		store:         store,
+		mailer:        m,
+		bookDir:       bookDir,
+		allowed:       allowed,
+		pending:       make(map[int64]*pendingSetup),
+		confirmations: make(map[int64]*pendingConfirmation),
+	}
+}
+
+// Utilities (no Bot state needed).
+
 func confirmationKeyboard() tgbotapi.InlineKeyboardMarkup {
 	return tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
@@ -52,155 +77,8 @@ func confirmationKeyboard() tgbotapi.InlineKeyboardMarkup {
 	)
 }
 
-func sendMsg(bot *tgbotapi.BotAPI, msg tgbotapi.Chattable) {
-	if _, err := bot.Send(msg); err != nil {
-		log.Printf("Failed to send message: %v", err)
-	}
-}
-
-func removeAll(path string) {
-	if err := os.RemoveAll(path); err != nil {
-		log.Printf("Failed to remove %s: %v", path, err)
-	}
-}
-
 func confirmationText(title, author string) string {
 	return fmt.Sprintf("Title: %s\nAuthor: %s", title, author)
-}
-
-func newBookDir(parentDir string) (string, error) {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "", fmt.Errorf("generate uuid: %w", err)
-	}
-	name := hex.EncodeToString(b[:])
-	bookDir := filepath.Join(parentDir, name)
-	if err := os.MkdirAll(bookDir, 0755); err != nil {
-		return "", fmt.Errorf("create book directory %s: %w", bookDir, err)
-	}
-	return bookDir, nil
-}
-
-// downloadFile downloads a document into a new subdirectory, preserving its extension.
-// Returns the book directory and the path to the saved file.
-func downloadFile(bot *tgbotapi.BotAPI, doc *tgbotapi.Document, dir string, ext string) (bookDir string, savedPath string, err error) {
-	fileURL, err := bot.GetFileDirectURL(doc.FileID)
-	if err != nil {
-		return "", "", fmt.Errorf("get file URL: %w", err)
-	}
-
-	client := &http.Client{Timeout: 2 * time.Minute}
-	resp, err := client.Get(fileURL)
-	if err != nil {
-		return "", "", fmt.Errorf("download file: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", "", fmt.Errorf("download file: unexpected status %d", resp.StatusCode)
-	}
-
-	bookDir, err = newBookDir(dir)
-	if err != nil {
-		return "", "", err
-	}
-
-	savePath := filepath.Join(bookDir, "original"+ext)
-	out, err := os.Create(savePath)
-	if err != nil {
-		removeAll(bookDir)
-		return "", "", fmt.Errorf("create file %s: %w", savePath, err)
-	}
-
-	_, err = io.Copy(out, resp.Body)
-	if closeErr := out.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		removeAll(bookDir)
-		return "", "", fmt.Errorf("save file %s: %w", savePath, err)
-	}
-
-	log.Printf("Saved file to %s", savePath)
-	return bookDir, savePath, nil
-}
-
-func cancelPendingConfirmation(bot *tgbotapi.BotAPI, confirmations map[int64]*pendingConfirmation, userID int64) {
-	if pc, ok := confirmations[userID]; ok {
-		removeAll(pc.bookDir)
-		edit := tgbotapi.NewEditMessageText(pc.chatID, pc.messageID, "Cancelled (new file received).")
-		sendMsg(bot, edit)
-		delete(confirmations, userID)
-	}
-}
-
-func processDocument(bot *tgbotapi.BotAPI, chatID int64, doc *tgbotapi.Document, dir string, confirmations map[int64]*pendingConfirmation, userID int64) {
-	ext := strings.ToLower(filepath.Ext(doc.FileName))
-	if !converter.IsSupportedFormat(ext) {
-		reply := tgbotapi.NewMessage(chatID,
-			"Unsupported file format. Supported formats: EPUB, FB2, MOBI.")
-		sendMsg(bot, reply)
-		return
-	}
-
-	cancelPendingConfirmation(bot, confirmations, userID)
-
-	bookDir, downloadedPath, err := downloadFile(bot, doc, dir, ext)
-	if err != nil {
-		log.Printf("Failed to process document: %v", err)
-		reply := tgbotapi.NewMessage(chatID, "Failed to download the file. Please try again.")
-		sendMsg(bot, reply)
-		return
-	}
-
-	epubPath := downloadedPath
-
-	if converter.NeedsConversion(ext) {
-		statusMsg := tgbotapi.NewMessage(chatID, "Converting to EPUB...")
-		sendMsg(bot, statusMsg)
-
-		epubPath, err = converter.ConvertToEPUB(downloadedPath, bookDir)
-		if err != nil {
-			log.Printf("Conversion failed for %s: %v", doc.FileName, err)
-			removeAll(bookDir)
-			userMsg := err.Error()
-			if ce, ok := err.(*converter.ConvertError); ok {
-				userMsg = ce.UserMessage()
-			}
-			reply := tgbotapi.NewMessage(chatID,
-				fmt.Sprintf("Failed to convert the file to EPUB: %s", userMsg))
-			sendMsg(bot, reply)
-			return
-		}
-	}
-
-	meta, err := epub.ReadMetadata(epubPath)
-	if err != nil {
-		log.Printf("Failed to read EPUB metadata from %s: %v", epubPath, err)
-		removeAll(bookDir)
-		reply := tgbotapi.NewMessage(chatID, "Failed to read EPUB metadata. Is the file a valid EPUB?")
-		sendMsg(bot, reply)
-		return
-	}
-
-	msg := tgbotapi.NewMessage(chatID, confirmationText(meta.Title, meta.Author))
-	keyboard := confirmationKeyboard()
-	msg.ReplyMarkup = keyboard
-	sent, err := bot.Send(msg)
-	if err != nil {
-		log.Printf("Failed to send confirmation message: %v", err)
-		removeAll(bookDir)
-		return
-	}
-
-	confirmations[userID] = &pendingConfirmation{
-		chatID:    chatID,
-		bookDir:   bookDir,
-		epubPath:  epubPath,
-		title:     meta.Title,
-		author:    meta.Author,
-		messageID: sent.MessageID,
-	}
 }
 
 func isValidEmail(s string) bool {
@@ -241,6 +119,346 @@ func sanitizeFilename(s string) string {
 		}
 	}
 	return b.String()
+}
+
+func removeAll(path string) {
+	if err := os.RemoveAll(path); err != nil {
+		log.Printf("Failed to remove %s: %v", path, err)
+	}
+}
+
+func newBookDir(parentDir string) (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("generate uuid: %w", err)
+	}
+	name := hex.EncodeToString(b[:])
+	bookDir := filepath.Join(parentDir, name)
+	if err := os.MkdirAll(bookDir, 0755); err != nil {
+		return "", fmt.Errorf("create book directory %s: %w", bookDir, err)
+	}
+	return bookDir, nil
+}
+
+// Bot helper methods.
+
+func (b *Bot) sendMsg(msg tgbotapi.Chattable) {
+	if _, err := b.api.Send(msg); err != nil {
+		log.Printf("Failed to send message: %v", err)
+	}
+}
+
+func (b *Bot) downloadFile(doc *tgbotapi.Document, ext string) (bookDir string, savedPath string, err error) {
+	fileURL, err := b.api.GetFileDirectURL(doc.FileID)
+	if err != nil {
+		return "", "", fmt.Errorf("get file URL: %w", err)
+	}
+
+	client := &http.Client{Timeout: 2 * time.Minute}
+	resp, err := client.Get(fileURL)
+	if err != nil {
+		return "", "", fmt.Errorf("download file: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", "", fmt.Errorf("download file: unexpected status %d", resp.StatusCode)
+	}
+
+	bookDir, err = newBookDir(b.bookDir)
+	if err != nil {
+		return "", "", err
+	}
+
+	savePath := filepath.Join(bookDir, "original"+ext)
+	out, err := os.Create(savePath)
+	if err != nil {
+		removeAll(bookDir)
+		return "", "", fmt.Errorf("create file %s: %w", savePath, err)
+	}
+
+	_, err = io.Copy(out, resp.Body)
+	if closeErr := out.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		removeAll(bookDir)
+		return "", "", fmt.Errorf("save file %s: %w", savePath, err)
+	}
+
+	log.Printf("Saved file to %s", savePath)
+	return bookDir, savePath, nil
+}
+
+func (b *Bot) cancelPendingConfirmation(userID int64) {
+	if pc, ok := b.confirmations[userID]; ok {
+		removeAll(pc.bookDir)
+		edit := tgbotapi.NewEditMessageText(pc.chatID, pc.messageID, "Cancelled (new file received).")
+		b.sendMsg(edit)
+		delete(b.confirmations, userID)
+	}
+}
+
+func (b *Bot) processDocument(chatID int64, doc *tgbotapi.Document, userID int64) {
+	ext := strings.ToLower(filepath.Ext(doc.FileName))
+	if !converter.IsSupportedFormat(ext) {
+		reply := tgbotapi.NewMessage(chatID,
+			"Unsupported file format. Supported formats: EPUB, FB2, MOBI.")
+		b.sendMsg(reply)
+		return
+	}
+
+	b.cancelPendingConfirmation(userID)
+
+	bookDir, downloadedPath, err := b.downloadFile(doc, ext)
+	if err != nil {
+		log.Printf("Failed to process document: %v", err)
+		reply := tgbotapi.NewMessage(chatID, "Failed to download the file. Please try again.")
+		b.sendMsg(reply)
+		return
+	}
+
+	epubPath := downloadedPath
+
+	if converter.NeedsConversion(ext) {
+		statusMsg := tgbotapi.NewMessage(chatID, "Converting to EPUB...")
+		b.sendMsg(statusMsg)
+
+		epubPath, err = converter.ConvertToEPUB(downloadedPath, bookDir)
+		if err != nil {
+			log.Printf("Conversion failed for %s: %v", doc.FileName, err)
+			removeAll(bookDir)
+			userMsg := err.Error()
+			if ce, ok := err.(*converter.ConvertError); ok {
+				userMsg = ce.UserMessage()
+			}
+			reply := tgbotapi.NewMessage(chatID,
+				fmt.Sprintf("Failed to convert the file to EPUB: %s", userMsg))
+			b.sendMsg(reply)
+			return
+		}
+	}
+
+	meta, err := epub.ReadMetadata(epubPath)
+	if err != nil {
+		log.Printf("Failed to read EPUB metadata from %s: %v", epubPath, err)
+		removeAll(bookDir)
+		reply := tgbotapi.NewMessage(chatID, "Failed to read EPUB metadata. Is the file a valid EPUB?")
+		b.sendMsg(reply)
+		return
+	}
+
+	msg := tgbotapi.NewMessage(chatID, confirmationText(meta.Title, meta.Author))
+	keyboard := confirmationKeyboard()
+	msg.ReplyMarkup = keyboard
+	sent, err := b.api.Send(msg)
+	if err != nil {
+		log.Printf("Failed to send confirmation message: %v", err)
+		removeAll(bookDir)
+		return
+	}
+
+	b.confirmations[userID] = &pendingConfirmation{
+		chatID:    chatID,
+		bookDir:   bookDir,
+		epubPath:  epubPath,
+		title:     meta.Title,
+		author:    meta.Author,
+		messageID: sent.MessageID,
+	}
+}
+
+// Handler methods.
+
+func (b *Bot) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
+	from := cq.From
+	if from == nil {
+		return
+	}
+	userID := from.ID
+	pc, ok := b.confirmations[userID]
+	if !ok {
+		callback := tgbotapi.NewCallback(cq.ID, "No pending file.")
+		if _, err := b.api.Request(callback); err != nil {
+			log.Printf("Failed to answer callback query: %v", err)
+		}
+		return
+	}
+
+	switch cq.Data {
+	case "confirm":
+		us, ok := b.store.GetSettings(strconv.FormatInt(userID, 10))
+		if !ok {
+			log.Printf("Settings missing for user %d at confirm time", userID)
+			reply := tgbotapi.NewMessage(pc.chatID, "Your Kindle email is no longer configured. Please send your email address to set it up again.")
+			b.sendMsg(reply)
+			removeAll(pc.bookDir)
+			delete(b.confirmations, userID)
+			b.pending[userID] = &pendingSetup{chatID: pc.chatID}
+			break
+		}
+
+		newName := sanitizeFilename(pc.title+" - "+pc.author) + ".epub"
+		sendPath := filepath.Join(pc.bookDir, newName)
+
+		if err := copyFile(pc.epubPath, sendPath); err != nil {
+			log.Printf("Failed to copy file: %v", err)
+			b.sendMsg(tgbotapi.NewMessage(pc.chatID, "Failed to prepare the book for sending. Please try again."))
+			break
+		}
+
+		if err := epub.WriteMetadata(sendPath, epub.Metadata{Title: pc.title, Author: pc.author}); err != nil {
+			log.Printf("Failed to write metadata: %v", err)
+			b.sendMsg(tgbotapi.NewMessage(pc.chatID, "Failed to update book metadata. Please try again."))
+			break
+		}
+
+		log.Printf("Sending book %q (file: %s) to %s", pc.title, sendPath, us.KindleEmail)
+		if err := b.mailer.SendBook(us.KindleEmail, sendPath); err != nil {
+			log.Printf("Failed to send book %q to %s: %v", pc.title, us.KindleEmail, err)
+			b.sendMsg(tgbotapi.NewMessage(pc.chatID, "Failed to email the book. Please try again."))
+			break
+		}
+
+		log.Printf("Successfully sent book %q (file: %s) to %s", pc.title, sendPath, us.KindleEmail)
+		removeAll(pc.bookDir)
+		b.sendMsg(tgbotapi.NewMessage(pc.chatID, fmt.Sprintf("Sent %q to %s!", pc.title, us.KindleEmail)))
+		delete(b.confirmations, userID)
+
+	case "edit_title":
+		pc.waitingFor = "title"
+		b.sendMsg(tgbotapi.NewMessage(pc.chatID, "Send me the new title."))
+
+	case "edit_author":
+		pc.waitingFor = "author"
+		b.sendMsg(tgbotapi.NewMessage(pc.chatID, "Send me the new author."))
+
+	case "cancel":
+		removeAll(pc.bookDir)
+		b.sendMsg(tgbotapi.NewEditMessageText(pc.chatID, pc.messageID, "Cancelled."))
+		delete(b.confirmations, userID)
+	}
+
+	callback := tgbotapi.NewCallback(cq.ID, "")
+	if _, err := b.api.Request(callback); err != nil {
+		log.Printf("Failed to answer callback query: %v", err)
+	}
+}
+
+// handleMetadataEdit handles text input for editing title/author.
+// Returns true if the message was consumed.
+func (b *Bot) handleMetadataEdit(pc *pendingConfirmation, userID int64, text string) bool {
+	if text == "/cancel" {
+		removeAll(pc.bookDir)
+		b.sendMsg(tgbotapi.NewEditMessageText(pc.chatID, pc.messageID, "Cancelled."))
+		delete(b.confirmations, userID)
+		return true
+	}
+
+	switch pc.waitingFor {
+	case "title":
+		pc.title = text
+	case "author":
+		pc.author = text
+	}
+	pc.waitingFor = ""
+
+	edit := tgbotapi.NewEditMessageText(pc.chatID, pc.messageID, confirmationText(pc.title, pc.author))
+	keyboard := confirmationKeyboard()
+	edit.ReplyMarkup = &keyboard
+	b.sendMsg(edit)
+	return true
+}
+
+func (b *Bot) handleSetup(chatID int64, userID int64, msg *tgbotapi.Message) {
+	userKey := strconv.FormatInt(userID, 10)
+	ps, isPending := b.pending[userID]
+	if isPending {
+		text := strings.TrimSpace(msg.Text)
+		if text != "" && isValidEmail(text) {
+			us := settings.UserSettings{KindleEmail: text}
+			if err := b.store.SetSettings(userKey, us); err != nil {
+				log.Printf("Failed to save settings for user %d: %v", userID, err)
+				b.sendMsg(tgbotapi.NewMessage(chatID, "Failed to save settings. Please try again."))
+				return
+			}
+			b.sendMsg(tgbotapi.NewMessage(chatID, fmt.Sprintf("Saved! Kindle email set to %s", text)))
+			if ps.document != nil {
+				b.processDocument(chatID, ps.document, userID)
+			}
+			delete(b.pending, userID)
+		} else if msg.Document != nil {
+			ps.document = msg.Document
+			log.Printf("Received file %q from user %d (pending setup)", msg.Document.FileName, userID)
+			b.sendMsg(tgbotapi.NewMessage(chatID, "I still need your Send-to-Kindle email address first. Please send it as a text message."))
+		} else {
+			b.sendMsg(tgbotapi.NewMessage(chatID, "That doesn't look like a valid email address. Please try again."))
+		}
+	} else {
+		ps := &pendingSetup{chatID: chatID}
+		if msg.Document != nil {
+			ps.document = msg.Document
+			log.Printf("Received file %q from user %d (pending setup)", msg.Document.FileName, userID)
+		}
+		b.pending[userID] = ps
+		b.sendMsg(tgbotapi.NewMessage(chatID, "Welcome! Please send me your Send-to-Kindle email address."))
+	}
+}
+
+func (b *Bot) handleMessage(msg *tgbotapi.Message) {
+	from := msg.From
+	if from == nil {
+		return
+	}
+
+	if len(b.allowed) > 0 && !b.allowed[strings.ToLower(from.UserName)] {
+		log.Printf("Ignoring message from unauthorized user %q (ID %d)", from.UserName, from.ID)
+		return
+	}
+
+	chatID := msg.Chat.ID
+	userID := from.ID
+	userKey := strconv.FormatInt(userID, 10)
+
+	// Handle text input for editing title/author.
+	if pc, ok := b.confirmations[userID]; ok && pc.waitingFor != "" && msg.Text != "" {
+		text := strings.TrimSpace(msg.Text)
+		if b.handleMetadataEdit(pc, userID, text) {
+			return
+		}
+	}
+
+	_, hasSettings := b.store.GetSettings(userKey)
+	if !hasSettings {
+		b.handleSetup(chatID, userID, msg)
+		return
+	}
+
+	// Normal path: user has settings.
+	if msg.Document == nil {
+		return
+	}
+
+	doc := msg.Document
+	log.Printf("Received file %q from user %d", doc.FileName, userID)
+	b.processDocument(chatID, doc, userID)
+}
+
+// Run starts the update loop.
+func (b *Bot) Run() {
+	u := tgbotapi.NewUpdate(0)
+	u.Timeout = 60
+	updates := b.api.GetUpdatesChan(u)
+
+	for update := range updates {
+		if update.CallbackQuery != nil {
+			b.handleCallbackQuery(update.CallbackQuery)
+			continue
+		}
+		if update.Message != nil {
+			b.handleMessage(update.Message)
+		}
+	}
 }
 
 func main() {
@@ -325,187 +543,11 @@ func main() {
 		log.Fatalf("Failed to load settings: %v", err)
 	}
 
-	bot, err := tgbotapi.NewBotAPI(token)
+	api, err := tgbotapi.NewBotAPI(token)
 	if err != nil {
 		log.Fatalf("Failed to create bot: %v", err)
 	}
-	log.Printf("Authorized as @%s", bot.Self.UserName)
+	log.Printf("Authorized as @%s", api.Self.UserName)
 
-	u := tgbotapi.NewUpdate(0)
-	u.Timeout = 60
-	updates := bot.GetUpdatesChan(u)
-
-	pending := make(map[int64]*pendingSetup)
-	confirmations := make(map[int64]*pendingConfirmation)
-
-	for update := range updates {
-		// Handle callback queries (inline button presses).
-		if update.CallbackQuery != nil {
-			from := update.CallbackQuery.From
-			if from == nil {
-				continue
-			}
-			userID := from.ID
-			pc, ok := confirmations[userID]
-			if !ok {
-				callback := tgbotapi.NewCallback(update.CallbackQuery.ID, "No pending file.")
-				if _, err := bot.Request(callback); err != nil {
-					log.Printf("Failed to answer callback query: %v", err)
-				}
-				continue
-			}
-
-			switch update.CallbackQuery.Data {
-			case "confirm":
-				us, ok := store.GetSettings(strconv.FormatInt(userID, 10))
-				if !ok {
-					log.Printf("Settings missing for user %d at confirm time", userID)
-					reply := tgbotapi.NewMessage(pc.chatID, "Your Kindle email is no longer configured. Please send your email address to set it up again.")
-					sendMsg(bot, reply)
-					removeAll(pc.bookDir)
-					delete(confirmations, userID)
-					pending[userID] = &pendingSetup{chatID: pc.chatID}
-					break
-				}
-
-				newName := sanitizeFilename(pc.title+" - "+pc.author) + ".epub"
-				sendPath := filepath.Join(pc.bookDir, newName)
-
-				if err := copyFile(pc.epubPath, sendPath); err != nil {
-					log.Printf("Failed to copy file: %v", err)
-					sendMsg(bot, tgbotapi.NewMessage(pc.chatID, "Failed to prepare the book for sending. Please try again."))
-					break
-				}
-
-				if err := epub.WriteMetadata(sendPath, epub.Metadata{Title: pc.title, Author: pc.author}); err != nil {
-					log.Printf("Failed to write metadata: %v", err)
-					sendMsg(bot, tgbotapi.NewMessage(pc.chatID, "Failed to update book metadata. Please try again."))
-					break
-				}
-
-				log.Printf("Sending book %q (file: %s) to %s", pc.title, sendPath, us.KindleEmail)
-				if err := m.SendBook(us.KindleEmail, sendPath); err != nil {
-					log.Printf("Failed to send book %q to %s: %v", pc.title, us.KindleEmail, err)
-					sendMsg(bot, tgbotapi.NewMessage(pc.chatID, "Failed to email the book. Please try again."))
-					break
-				}
-
-				log.Printf("Successfully sent book %q (file: %s) to %s", pc.title, sendPath, us.KindleEmail)
-				removeAll(pc.bookDir)
-				sendMsg(bot, tgbotapi.NewMessage(pc.chatID, fmt.Sprintf("Sent %q to %s!", pc.title, us.KindleEmail)))
-				delete(confirmations, userID)
-
-			case "edit_title":
-				pc.waitingFor = "title"
-				sendMsg(bot, tgbotapi.NewMessage(pc.chatID, "Send me the new title."))
-
-			case "edit_author":
-				pc.waitingFor = "author"
-				sendMsg(bot, tgbotapi.NewMessage(pc.chatID, "Send me the new author."))
-
-			case "cancel":
-				removeAll(pc.bookDir)
-				sendMsg(bot, tgbotapi.NewEditMessageText(pc.chatID, pc.messageID, "Cancelled."))
-				delete(confirmations, userID)
-			}
-
-			callback := tgbotapi.NewCallback(update.CallbackQuery.ID, "")
-			if _, err := bot.Request(callback); err != nil {
-				log.Printf("Failed to answer callback query: %v", err)
-			}
-			continue
-		}
-
-		if update.Message == nil {
-			continue
-		}
-
-		from := update.Message.From
-		if from == nil {
-			continue
-		}
-
-		if len(allowed) > 0 && !allowed[strings.ToLower(from.UserName)] {
-			log.Printf("Ignoring message from unauthorized user %q (ID %d)", from.UserName, from.ID)
-			continue
-		}
-
-		chatID := update.Message.Chat.ID
-		userID := from.ID
-		userKey := strconv.FormatInt(userID, 10)
-
-		// Handle text input for editing title/author.
-		if pc, ok := confirmations[userID]; ok && pc.waitingFor != "" && update.Message.Text != "" {
-			text := strings.TrimSpace(update.Message.Text)
-
-			if text == "/cancel" {
-				removeAll(pc.bookDir)
-				sendMsg(bot, tgbotapi.NewEditMessageText(pc.chatID, pc.messageID, "Cancelled."))
-				delete(confirmations, userID)
-				continue
-			}
-
-			switch pc.waitingFor {
-			case "title":
-				pc.title = text
-			case "author":
-				pc.author = text
-			}
-			pc.waitingFor = ""
-
-			// Update the confirmation message with new values.
-			edit := tgbotapi.NewEditMessageText(pc.chatID, pc.messageID, confirmationText(pc.title, pc.author))
-			keyboard := confirmationKeyboard()
-			edit.ReplyMarkup = &keyboard
-			sendMsg(bot, edit)
-			continue
-		}
-
-		_, hasSettings := store.GetSettings(userKey)
-		if !hasSettings {
-			ps, isPending := pending[userID]
-			if isPending {
-				// User is in setup: expecting an email reply.
-				text := strings.TrimSpace(update.Message.Text)
-				if text != "" && isValidEmail(text) {
-					us := settings.UserSettings{KindleEmail: text}
-					if err := store.SetSettings(userKey, us); err != nil {
-						log.Printf("Failed to save settings for user %d: %v", userID, err)
-						sendMsg(bot, tgbotapi.NewMessage(chatID, "Failed to save settings. Please try again."))
-						continue
-					}
-					sendMsg(bot, tgbotapi.NewMessage(chatID, fmt.Sprintf("Saved! Kindle email set to %s", text)))
-					if ps.document != nil {
-						processDocument(bot, chatID, ps.document, bookDir, confirmations, userID)
-					}
-					delete(pending, userID)
-				} else if update.Message.Document != nil {
-					ps.document = update.Message.Document
-					log.Printf("Received file %q from user %d (pending setup)", update.Message.Document.FileName, userID)
-					sendMsg(bot, tgbotapi.NewMessage(chatID, "I still need your Send-to-Kindle email address first. Please send it as a text message."))
-				} else {
-					sendMsg(bot, tgbotapi.NewMessage(chatID, "That doesn't look like a valid email address. Please try again."))
-				}
-			} else {
-				// First contact.
-				ps := &pendingSetup{chatID: chatID}
-				if update.Message.Document != nil {
-					ps.document = update.Message.Document
-					log.Printf("Received file %q from user %d (pending setup)", update.Message.Document.FileName, userID)
-				}
-				pending[userID] = ps
-				sendMsg(bot, tgbotapi.NewMessage(chatID, "Welcome! Please send me your Send-to-Kindle email address."))
-			}
-			continue
-		}
-
-		// Normal path: user has settings.
-		if update.Message.Document == nil {
-			continue
-		}
-
-		doc := update.Message.Document
-		log.Printf("Received file %q from user %d", doc.FileName, userID)
-		processDocument(bot, chatID, doc, bookDir, confirmations, userID)
-	}
+	newBot(api, store, m, bookDir, allowed).Run()
 }
