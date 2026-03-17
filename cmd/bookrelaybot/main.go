@@ -78,8 +78,12 @@ func confirmationKeyboard() tgbotapi.InlineKeyboardMarkup {
 	)
 }
 
-func confirmationText(title, author string) string {
-	return fmt.Sprintf("Title: %s\nAuthor: %s", title, author)
+func confirmationText(title, author, status string) string {
+	text := fmt.Sprintf("Title: %s\nAuthor: %s", title, author)
+	if status != "" {
+		text += "\n\n" + status
+	}
+	return text
 }
 
 func isValidEmail(s string) bool {
@@ -263,7 +267,7 @@ func (b *Bot) processDocument(chatID int64, doc *tgbotapi.Document, userID int64
 		return
 	}
 
-	msg := tgbotapi.NewMessage(chatID, confirmationText(meta.Title, meta.Author))
+	msg := tgbotapi.NewMessage(chatID, confirmationText(meta.Title, meta.Author, ""))
 	keyboard := confirmationKeyboard()
 	msg.ReplyMarkup = keyboard
 	sent, err := b.api.Send(msg)
@@ -370,18 +374,28 @@ func (b *Bot) handleMetadataEdit(pc *pendingConfirmation, userID int64, text str
 		return true
 	}
 
+	var status string
 	switch pc.waitingFor {
 	case "title":
 		pc.title = text
+		status = "✏️ Title updated"
 	case "author":
 		pc.author = text
+		status = "✏️ Author updated"
 	}
 	pc.waitingFor = ""
 
-	edit := tgbotapi.NewEditMessageText(pc.chatID, pc.messageID, confirmationText(pc.title, pc.author))
+	edit := tgbotapi.NewEditMessageText(pc.chatID, pc.messageID, confirmationText(pc.title, pc.author, status))
 	keyboard := confirmationKeyboard()
 	edit.ReplyMarkup = &keyboard
-	b.sendMsg(edit)
+	if _, err := b.api.Send(edit); err != nil {
+		// Telegram returns an error when the message text is identical
+		// (e.g. same field set to the same value). This is harmless —
+		// the user already sees the correct content.
+		if !strings.Contains(err.Error(), "message is not modified") {
+			log.Printf("Failed to send message: %v", err)
+		}
+	}
 	return true
 }
 
